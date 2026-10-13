@@ -34,6 +34,10 @@ def signed_urls(value, pointer=""):
                 and isinstance(item, str)
                 and safe_output(item) != item
             ):
+                try:
+                    transfer_url(item)
+                except ApiError, ValueError:
+                    continue
                 yield child, item
             else:
                 yield from signed_urls(item, child)

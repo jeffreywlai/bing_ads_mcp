@@ -407,9 +407,12 @@ absolute path directly.
 
 For text files, `read_artifact(encoding="utf-8")` avoids base64. Offsets always
 count bytes; follow `next_offset` until null to respect multibyte character
-boundaries. Base64 remains the default for exact binary retrieval. Signed URL
-credentials are redacted from MCP JSON results and errors after downloads use
-the original URL internally; downloaded source files retain their exact bytes.
+boundaries. Base64 remains the default for exact binary retrieval. Credential query
+parameters on Microsoft transfer/sign-in URLs, and URL usernames/passwords, are
+redacted from MCP JSON results and errors after downloads use the original URL
+internally; downloaded source files retain their exact bytes. Ordinary advertising
+URL query parameters, including `code`, `key` and `token`, are preserved in both
+displayed results and saved snapshots.
 For other native reads returning signed file URLs, such as offline-conversion
 reports, set `read_api(download_files=true)` to save files before redaction.
 Downloads enforce the same Microsoft-host allowlist and preserve the API result

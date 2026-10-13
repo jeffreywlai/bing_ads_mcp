@@ -401,7 +401,9 @@ async def test_signed_url_download_uses_original_but_never_echoes_credentials(
         "private"
         not in Artifacts(tmp_path).path(bounded["complete_result"]["artifact"]).read_text()
     )
-    assert "secret" not in safe_output("https://example.com?%73IG=secret&ok=1#access_token=secret")
+    assert "secret" not in safe_output(
+        "https://reports.blob.core.windows.net/file?%73IG=secret&ok=1#access_token=secret"
+    )
 
 
 def test_retention_warns_without_clipping_and_does_not_guess_unknown_types():
@@ -692,4 +694,4 @@ def test_wrong_collection_type_still_returns_advisory_diagnostics(client):
     preview = client.preview("campaign", "update_ad_groups", {"AdGroups": 12}, SCOPE)
     assert preview["warnings"] == [{"path": "AdGroups", "issue": "Expected an array."}]
     assert preview["request"] == {"AdGroups": 12}
-    assert "password" not in safe_output("HTTPS://name:password@example.com/a?SIG=password")
+    assert "password" not in safe_output("HTTPS://name:password@example.com/a?SIG=campaign")

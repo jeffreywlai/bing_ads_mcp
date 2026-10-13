@@ -1,7 +1,7 @@
 """Redact URL credentials at the output boundary, after internal downloads use them."""
 
 import re
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlsplit
 
 SECRET_PARAMETERS = {
     "sig",
@@ -23,6 +23,18 @@ def safe_output(value):
     if isinstance(value, str):
 
         def url(match):
+            original = match[0]
+            try:
+                host = (urlsplit(original).hostname or "").rstrip(".")
+            except ValueError:
+                host = ""
+            value = re.sub(r"(https?://)[^/?#]*@", r"\1[REDACTED]@", original, flags=re.IGNORECASE)
+            # Query names alone do not identify secrets in advertiser URLs:
+            # code, key, token and sig can all be ordinary campaign parameters.
+            if host not in {"login.microsoftonline.com", "login.live.com"} and not host.endswith(
+                (".bingads.microsoft.com", ".blob.core.windows.net")
+            ):
+                return value
             return re.sub(
                 r"([?&#])([^=&?#]+)=([^&#]*)",
                 lambda m: (
@@ -30,7 +42,7 @@ def safe_output(value):
                     if unquote_plus(m[2]).casefold() in SECRET_PARAMETERS
                     else m[0]
                 ),
-                re.sub(r"(https?://)[^/?#]*@", r"\1[REDACTED]@", match[0], flags=re.IGNORECASE),
+                value,
             )
 
         return re.sub(r"https?://[^\s<>\"']+", url, value, flags=re.IGNORECASE)
