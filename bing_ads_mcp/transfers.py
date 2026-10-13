@@ -3,6 +3,7 @@
 import asyncio
 import csv
 import io
+import json
 import os
 import tempfile
 import time
@@ -13,11 +14,42 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from . import reporting
 from .artifacts import Artifacts
 from .client import AdsClient, ApiError
 from .models import Scope
+from .privacy import safe_output
 
 MAX_TRANSFER_BYTES = 1024 * 1024 * 1024
+
+
+def signed_urls(value, pointer=""):
+    """Locate signed download URLs without exposing their credential-bearing values."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = pointer + "/" + key.replace("~", "~0").replace("/", "~1")
+            if (
+                key.lower().endswith("url")
+                and "upload" not in key.lower()
+                and isinstance(item, str)
+                and safe_output(item) != item
+            ):
+                yield child, item
+            else:
+                yield from signed_urls(item, child)
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            yield from signed_urls(item, f"{pointer}/{i}")
+
+
+async def download_response_files(client, artifacts, output):
+    downloaded = []
+    for pointer, url in signed_urls(output):
+        try:
+            downloaded.append({"pointer": pointer, **await download(client.http, artifacts, url)})
+        except ApiError as exc:
+            downloaded.append({"pointer": pointer, "status": "unavailable", "error": exc.details})
+    return downloaded
 
 
 def transfer_url(url: str, *, upload: bool = False) -> str:
@@ -114,14 +146,25 @@ def csv_rows(artifacts: Artifacts, artifact: str) -> list[dict]:
     return rows
 
 
-async def submit_report(client: AdsClient, scope: Scope, request: dict) -> dict:
-    if not request.get("Type"):
+async def submit_report(
+    client: AdsClient, scope: Scope, request: dict, artifacts: Artifacts | None = None
+) -> dict:
+    if not isinstance(request.get("Type"), str) or not request["Type"]:
         raise ApiError(
             "ReportRequest.Type is required. Discover all types with list_models(reporting)."
         )
-    return await client.execute(
+    context = reporting.request_context(request)
+    output = await client.execute(
         "reporting", "submit_generate_report", {"ReportRequest": request}, scope
     )
+    output["report_context"] = context
+    request_id = output.get("data", {}).get("ReportRequestId")
+    if artifacts is not None and request_id:
+        try:
+            reporting.remember(artifacts, client.settings.environment, scope, request_id, context)
+        except OSError:
+            output["context_warning"] = "Could not persist report context; retain this response."
+    return output
 
 
 async def poll_report(
@@ -136,11 +179,19 @@ async def poll_report(
         state = status.get("Status")
         if state == "Success":
             url = status.get("ReportDownloadUrl")
+            downloaded = await download(client.http, artifacts, url) if url else {"files": []}
             return {
                 "request_id": request_id,
                 "status": state,
                 "no_data": not bool(url),
-                **(await download(client.http, artifacts, url) if url else {"files": []}),
+                **downloaded,
+                "report_context": reporting.coverage(
+                    artifacts,
+                    getattr(getattr(client, "settings", None), "environment", "production"),
+                    scope,
+                    request_id,
+                    downloaded["files"],
+                ),
             }
         if state != "Pending":
             raise ApiError(
@@ -164,18 +215,47 @@ async def poll_bulk(
     state = body.get("RequestStatus")
     url = body.get("ResultFileUrl")
     files = await download(client.http, artifacts, url) if url else {}
-    return {
+    output = {
         "request_id": request_id,
         "status": state,
-        "provider_response": body,
+        "provider_response": safe_output(body),
         **files,
         "guidance": "Inspect every result row for errors; completed uploads can have failures. "
         "For pending jobs call get_bulk_result again with this ID.",
     }
+    if upload and state in {"Completed", "CompletedWithErrors"}:
+        from .bulk_verification import verify_campaign_rows
+
+        try:
+            context = artifacts.json_value(
+                reporting.context_name(client.settings.environment, scope, request_id, "bulk")
+            )
+            output["verification"] = (
+                await verify_campaign_rows(
+                    client, artifacts, scope, csv_rows(artifacts, context["artifact"])
+                )
+                if context["verify"]
+                else {"status": "disabled"}
+            )
+        except Exception as exc:
+            output["verification"] = {
+                "status": "unverified",
+                "error": exc.details
+                if isinstance(exc, ApiError)
+                else {
+                    "message": "Upload context or read-back unavailable. Verify entities manually."
+                },
+            }
+    return output
 
 
 async def upload_bulk(
-    client: AdsClient, artifacts: Artifacts, scope: Scope, csv_content: str, dry_run: bool = True
+    client: AdsClient,
+    artifacts: Artifacts,
+    scope: Scope,
+    csv_content: str,
+    dry_run: bool = True,
+    verify: bool = True,
 ) -> dict:
     """Accept content, never a local path to an arbitrary file that might hold secrets."""
     data = csv_content.lstrip("\ufeff").encode("utf-8-sig")
@@ -205,6 +285,10 @@ async def upload_bulk(
         "records": len(rows) - 1,
         "file": artifacts.save(data, "csv"),
         "validation": "Local preview only. Microsoft has not validated the CSV.",
+        "verification": "After completion, get_bulk_result reads back supported Campaign updates. "
+        "Other records/columns require manual verification; see the Bulk Campaign schema.",
+        "documentation": "https://learn.microsoft.com/en-us/advertising/bulk-service/campaign"
+        "?view=bingads-13",
     }
     if dry_run:
         return preview
@@ -217,6 +301,18 @@ async def upload_bulk(
         scope,
     )
     job = created["data"]
+    try:
+        artifacts.save(
+            json.dumps({"artifact": preview["file"]["artifact"], "verify": verify}).encode(),
+            "json",
+            name=reporting.context_name(
+                client.settings.environment, scope, job["RequestId"], "bulk"
+            ),
+        )
+    except OSError:
+        raise ApiError(
+            "Could not save bulk job context. No CSV was uploaded.", sent=False
+        ) from None
     url = transfer_url(job["UploadUrl"], upload=True)
     headers = await client.headers(scope, legacy=True)
     headers.pop("Content-Type")

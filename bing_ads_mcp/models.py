@@ -41,3 +41,10 @@ class EntityQuery(Input):
     performance_time: dict | None = None
     return_only_complete_data: bool = True
     performance_report_ids: dict[str, str] = Field(default_factory=dict)
+    fields: list[str] | None = Field(
+        default=None, description="Optional exact field names or dotted paths; default all fields."
+    )
+    numeric_fields: list[str] = Field(
+        default_factory=list,
+        description="Metric fields to parse alongside raw cells; percentages stay in points.",
+    )

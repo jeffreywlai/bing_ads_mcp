@@ -1,8 +1,10 @@
 """FastMCP entry point: a small tool surface over the complete API catalog."""
 
 import argparse
+import hashlib
+import json
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Literal
 
 import httpx
 from fastmcp import FastMCP
@@ -10,13 +12,14 @@ from fastmcp.server.dependencies import get_session
 from fastmcp.server.sessions import InvalidSession, create_session
 from pydantic import Field
 
-from . import content, conversions, transfers
-from .artifacts import Artifacts
+from . import content, conversions, mutations, transfers
+from .artifacts import INLINE_BYTES, Artifacts
 from .auth import Settings
 from .catalog import describe_model, models, operation, operations
 from .client import AdsClient, ApiError
 from .entities import get_entities
 from .models import EntityQuery, Id, Scope, Service
+from .validation import normalized, operation_hints
 
 READ = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
 WRITE = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False}
@@ -57,17 +60,22 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
         lifespan=lifespan,
         mask_error_details=True,
         instructions=(
-            "Microsoft Advertising REST v13. Start with get_accounts. Use list_operations and "
+            "Microsoft Advertising REST v13. Start with get_accounts. Filter list_operations by "
+            "service/search, then use "
             "get_operation_schema for full native API access; inspect nested/derived models with "
             "get_model_schema. Use native PascalCase fields and decimal strings for 64-bit IDs. "
             "Writes start locked. After user authorization, call unlock_mutation_tools and pass "
             "its session_id on each write; call lock_mutation_tools with that ID when finished. "
             "write_api previews by default; dry_run=false sends a real change only with a valid "
             "unlocked session_id. Never reuse an unlock from another conversation. "
-            "Local previews are not provider validation. Never blindly repeat a write after an "
-            "uncertain outcome. "
+            "Local previews include advisory SDK checks. Use preflight=true "
+            "to preview replacement diffs; removals need allow_remove=true. Supported updates read "
+            "back by default; inspect verification before claiming success. Never blindly repeat "
+            "a write after an uncertain outcome. "
             "Reports/bulk jobs submit once and resume by request ID. All returned provider fields "
-            "and errors are retained; oversized results are available through read_artifact. "
+            "and errors are retained except URL credentials. Analyze large local artifact files, "
+            "or use read_json_artifact/read_csv_rows with filters, fields and numeric_fields. "
+            "read_artifact supports UTF-8 or base64 bytes. Select report Columns for the task. "
             "Entity performance_time uses native ReportTime with explicit ReportTimeZone. "
             "Percentage values are percentage points; money is in account currency. This server "
             "uses the local signed-in user's permissions; it is not a shared multi-user gateway."
@@ -120,12 +128,19 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
         search: str = "",
         offset: Annotated[int, Field(ge=0)] = 0,
         limit: Annotated[int, Field(ge=1, le=100)] = 50,
+        details: bool = False,
     ) -> dict:
-        """Find any SDK API operation by name; read/write/job classification is server-owned."""
+        """Find operations with case/separator-insensitive search; details=true adds routes/docs.
+
+        Default entries are compact; use get_operation_schema for a selected operation.
+        """
         found = [
             op.describe()
+            if details
+            else {"service": op.service, "operation": op.name, "effect": op.effect}
             for op in operations().values()
-            if (service is None or op.service == service) and search.lower() in op.name.lower()
+            if (service is None or op.service == service)
+            and normalized(search) in normalized(op.name)
         ]
         return {
             "operations": found[offset : offset + limit],
@@ -138,7 +153,11 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
         """Inspect the installed SDK request fields, effect, route and Microsoft documentation."""
         op = operation(service, operation_name)
         return artifacts.bounded(
-            {**op.describe(), "schema": describe_model(service, op.model.__name__)}
+            {
+                **op.describe(),
+                "schema": describe_model(service, op.model.__name__),
+                **operation_hints(service, operation_name),
+            }
         )
 
     @mcp.tool(annotations=READ)
@@ -149,7 +168,7 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
         limit: Annotated[int, Field(ge=1, le=100)] = 50,
     ) -> dict:
         """Discover SDK objects/enums, including every report request and column enum."""
-        names = sorted(n for n in models(service) if search.casefold() in n.casefold())
+        names = sorted(n for n in models(service) if normalized(search) in normalized(n))
         return {
             "models": names[offset : offset + limit],
             "total": len(names),
@@ -163,16 +182,32 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
 
     @mcp.tool(annotations=JOB)
     async def read_api(
-        service: Service, operation_name: str, request: dict, scope: Scope | None = None
+        service: Service,
+        operation_name: str,
+        request: dict,
+        scope: Scope | None = None,
+        download_files: bool = False,
     ) -> dict:
         """Execute a native read or report/bulk-download job. Rejects every advertising write.
 
         All fields pass through to Microsoft unchanged; follow API pagination explicitly.
         Jobs are not retried. Prefer get_report/get_bulk_result for complete file delivery.
+        download_files=true saves signed Microsoft response files before URL redaction, including
+        offline conversion report files. Download errors retain the original API result/job ID.
         """
         if operation(service, operation_name).effect == "write":
             raise ApiError("This operation can change data. Use write_api.")
-        return artifacts.bounded(await current.execute(service, operation_name, request, scope))
+        output = await current.execute(service, operation_name, request, scope)
+        if download_files:
+            output["downloads"] = await transfers.download_response_files(
+                current, artifacts, output
+            )
+        elif any(transfers.signed_urls(output)):
+            output["download_hint"] = (
+                "URL credentials are redacted. For native reads, download_files=true saves the "
+                "files internally. Use get_report/get_bulk_result to poll existing jobs."
+            )
+        return artifacts.bounded(output)
 
     @mcp.tool(annotations=WRITE)
     async def write_api(
@@ -182,17 +217,33 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
         scope: Scope | None = None,
         dry_run: bool = True,
         session_id: MutationSession = None,
+        verify: bool = True,
+        allow_remove: bool = False,
+        preflight: bool = False,
     ) -> dict:
         """Preview or execute any SDK write: campaigns, audiences, billing or insights.
 
         dry_run=true is a local preview only. dry_run=false requires the session_id returned
         by unlock_mutation_tools and sends exactly once. Inspect
-        PartialErrors indices and null result slots; a returned HTTP 200 can be partially failed.
+        Inspect PartialErrors indices and null result slots. verify=true reads back campaign,
+        ad group and keyword updates and negative-site sets. preflight=true adds read-only calls
+        to replacement previews. Execution requires allow_remove=true for removals/empty site lists.
         """
         if not dry_run:
             await require_mutation_session(session_id)
         return artifacts.bounded(
-            await current.execute(service, operation_name, request, scope, dry_run=dry_run)
+            await mutations.execute(
+                current,
+                artifacts,
+                service,
+                operation_name,
+                request,
+                scope,
+                dry_run=dry_run,
+                verify=verify,
+                allow_remove=allow_remove,
+                preflight=preflight,
+            )
         )
 
     @mcp.tool(annotations=JOB)
@@ -204,7 +255,7 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
         ExcludeReportFooter=true, ExcludeColumnHeaders=false. Set Time.ReportTimeZone.
         ReturnOnlyCompleteData=true can reject today's/unprocessed data instead of guessing.
         """
-        return artifacts.bounded(await transfers.submit_report(current, scope, request))
+        return artifacts.bounded(await transfers.submit_report(current, scope, request, artifacts))
 
     @mcp.tool(annotations=READ)
     async def get_report(
@@ -224,18 +275,23 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
 
     @mcp.tool(annotations=WRITE)
     async def upload_bulk_csv(
-        scope: Scope, csv_content: str, dry_run: bool = True, session_id: MutationSession = None
+        scope: Scope,
+        csv_content: str,
+        dry_run: bool = True,
+        session_id: MutationSession = None,
+        verify: bool = True,
     ) -> dict:
         """Preview or upload native bulk CSV once; all entity types/columns pass through.
 
         Include the Format Version record (6.0). Upload result IDs/errors are retrieved with
         get_bulk_result(upload=true). Real uploads require session_id from unlock_mutation_tools.
-        Never retry the whole file after partial failures.
+        verify=true reads back supported Campaign updates when polled to completion; other records
+        stay unverified. Never retry the whole file after partial failures.
         """
         if not dry_run:
             await require_mutation_session(session_id)
         return artifacts.bounded(
-            await transfers.upload_bulk(current, artifacts, scope, csv_content, dry_run)
+            await transfers.upload_bulk(current, artifacts, scope, csv_content, dry_run, verify)
         )
 
     @mcp.tool(annotations=READ)
@@ -279,9 +335,110 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
         )
 
     @mcp.tool(annotations=READ)
-    def read_artifact(artifact: str, offset: int = 0, max_bytes: int = 12000) -> dict:
-        """Read exact bytes in base64 chunks. Repeat with next_offset to completion."""
-        return artifacts.read(artifact, offset, max_bytes)
+    def read_artifact(
+        artifact: str,
+        offset: int = 0,
+        max_bytes: int = 12000,
+        encoding: Literal["base64", "utf-8"] = "base64",
+    ) -> dict:
+        """Read exact bytes or readable UTF-8. Follow next_offset; offsets always count bytes.
+
+        Prefer read_json_artifact/read_csv_rows or local analysis for structured data.
+        """
+        return artifacts.read(artifact, offset, max_bytes, encoding)
+
+    @mcp.tool(annotations=READ)
+    def read_json_artifact(
+        artifact: str, pointer: str = "", query: EntityQuery | None = None
+    ) -> dict:
+        """Read structured JSON without base64. pointer uses JSON Pointer, e.g. /data/Campaigns.
+
+        Arrays support filters, sort, paging, fields and numeric_fields. Large objects list member
+        pointers; choose one to inspect. Snapshots use /rows. Source files remain complete.
+        """
+        from .entities import filter_sort
+
+        query = query or EntityQuery()
+        if query.performance_time:
+            raise ApiError("Artifact reads do not submit performance reports.")
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "artifact": artifact,
+                    "pointer": pointer,
+                    "query": query.model_dump(exclude={"next_page_token", "page_size"}),
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        if query.next_page_token:
+            return {
+                "artifact": artifact,
+                "pointer": pointer,
+                "kind": "snapshot",
+                **artifacts.entity_page(
+                    None,
+                    fingerprint,
+                    query.page_size,
+                    query.next_page_token,
+                    fields=query.fields,
+                    numeric_fields=query.numeric_fields,
+                ),
+            }
+        value = artifacts.json_value(artifact, pointer)
+        if isinstance(value, list):
+            rows = value
+            if (query.filters or query.sort_by) and any(not isinstance(r, dict) for r in rows):
+                raise ApiError("Filtering/sorting requires object rows; null slots are retained.")
+            rows = filter_sort(rows, query, metrics_nested=False)
+            kind = "array"
+        elif isinstance(value, dict) and len(json.dumps(value).encode()) > INLINE_BYTES - 2000:
+            if query.filters or query.sort_by or query.fields is not None or query.numeric_fields:
+                raise ApiError("Use a pointer to an array for query options.")
+            rows = [
+                {
+                    "pointer": pointer + "/" + key.replace("~", "~0").replace("/", "~1"),
+                    "type": "array"
+                    if isinstance(item, list)
+                    else "object"
+                    if isinstance(item, dict)
+                    else "scalar",
+                    **({"size": len(item)} if isinstance(item, (dict, list)) else {}),
+                }
+                for key, item in value.items()
+            ]
+            kind = "object_members"
+        else:
+            if any(
+                (
+                    query.filters,
+                    query.sort_by,
+                    query.fields is not None,
+                    query.numeric_fields,
+                    query.next_page_token,
+                )
+            ):
+                raise ApiError("Use a pointer to an array for query options.")
+            encoded = json.dumps(value, ensure_ascii=False).encode()
+            if len(encoded) > INLINE_BYTES - 2000:
+                return {
+                    "oversized_value": artifacts.save(encoded, "json"),
+                    "guidance": "Use read_artifact(encoding=utf-8) or read the local path.",
+                }
+            return artifacts.bounded({"artifact": artifact, "pointer": pointer, "value": value})
+        return {
+            "artifact": artifact,
+            "pointer": pointer,
+            "kind": kind,
+            **artifacts.entity_page(
+                None if query.next_page_token else rows,
+                fingerprint,
+                query.page_size,
+                query.next_page_token,
+                fields=query.fields,
+                numeric_fields=query.numeric_fields,
+            ),
+        }
 
     @mcp.tool(annotations=WRITE)
     async def submit_uet_events(
@@ -318,9 +475,6 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
             if query.next_page_token
             else filter_sort(transfers.csv_rows(artifacts, artifact), query, metrics_nested=False)
         )
-        import hashlib
-        import json
-
         fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -330,7 +484,14 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
                 sort_keys=True,
             ).encode()
         ).hexdigest()
-        return artifacts.entity_page(rows, fingerprint, query.page_size, query.next_page_token)
+        return artifacts.entity_page(
+            rows,
+            fingerprint,
+            query.page_size,
+            query.next_page_token,
+            fields=query.fields,
+            numeric_fields=query.numeric_fields,
+        )
 
     # One explicit wrapper per entity keeps usable MCP signatures without a custom router.
     @mcp.tool(annotations=READ)

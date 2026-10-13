@@ -314,7 +314,7 @@ async def test_entity_performance_resumes_report_and_keeps_supported_metrics(
     report = store.save(f"{id_column},Spend,{metric}\n{ids[kind]},5.50,2\n".encode(), "csv")
     submissions, polls = [], []
 
-    async def submit(client, scope, request):
+    async def submit(client, scope, request, artifacts):
         assert scope == SCOPE
         # Validate convenience requests against the independently generated SDK model.
         models("reporting")[family + "PerformanceReportRequest"].model_validate(request)

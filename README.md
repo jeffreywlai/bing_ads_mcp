@@ -5,14 +5,14 @@
 [![Microsoft Advertising API v13](https://img.shields.io/badge/Microsoft%20Advertising%20API-v13-blue.svg)](https://learn.microsoft.com/en-us/advertising/guides/?view=bingads-13)
 
 **An MCP server for reading reports and managing Microsoft Advertising accounts —
-24 tools over 290 SDK operations, plus Shopping Content and UET conversion events.**
+25 tools over 290 SDK operations, plus Shopping Content and UET conversion events.**
 
 > Ask Claude to "show my highest-spend campaigns last week" or "preview pausing
 > these campaigns."
 
 **This is not an officially supported Microsoft product.**
 
-[Quick start](#-quick-start) · [Available tools](#-available-tools-24) ·
+[Quick start](#-quick-start) · [Available tools](#-available-tools-25) ·
 [Agent guide](#-agent-guide) · [API coverage](#-api-coverage-and-current-limits)
 
 ## ✨ Features
@@ -26,6 +26,10 @@
   performance metrics.
 - **API discovery** — Find operations and inspect native request fields, enums,
   and derived models directly from Microsoft's installed REST SDK.
+- **Efficient results** — Compact operation discovery, structured JSON artifact
+  reads, and optional field selection. Full source files and snapshots remain available.
+- **Write verification** — Advisory SDK field/type checks, read-back for supported
+  updates, and explicit removal consent for negative-site replacements.
 - **Research and recommendations** — Access Ad Insight keyword ideas, estimates,
   auction insights, recommendations, and recommendation changes.
 - **Bulk and Shopping** — Bulk CSV upload/download and Shopping Content products,
@@ -40,12 +44,14 @@
 - **Install from GitHub** — Claude launches the published package with `uvx`.
   Analysts do not need a source checkout.
 
-Browser login and offline checks have passed. A user has confirmed successful
-live campaign changes through Claude. Live report downloads and broader API
-coverage still require end-to-end verification.
+Browser login and offline checks have passed. A user-provided October 13, 2026
+usage report verifies live entity reads, campaign/keyword changes, report downloads,
+bulk transfers and a Shopping product read through Claude on an earlier commit.
+The improvements below are covered by offline tests; they have not been rerun
+against a live advertising account. Broader API coverage still needs live verification.
 See [coverage and current limits](#-api-coverage-and-current-limits).
 
-## 📋 Available Tools (24)
+## 📋 Available Tools (25)
 
 Tool arguments below use the exact registered names. `scope` contains
 `customer_id` and `account_id`; `query` controls entity filters, performance, and
@@ -67,7 +73,7 @@ pagination. Both are explained in the [agent guide](#-agent-guide).
 
 | Tool | Purpose | Arguments |
 | --- | --- | --- |
-| `list_operations` | Search SDK operation names and their read/write/job classification | Optional `service`, `search`, `offset`, `limit` |
+| `list_operations` | Compact operation discovery; case/separator-insensitive search | Optional `service`, `search`, `offset`, `limit`, `details=false` |
 | `get_operation_schema` | Get a request schema, route, classification, and Microsoft documentation link | Required `service`, `operation_name` |
 | `list_models` | Find request objects, report types, column enums, and other models | Required `service`; optional `search`, `offset`, `limit` |
 | `get_model_schema` | Inspect native fields, enum values, and derived types | Required `service`, `model` |
@@ -76,8 +82,8 @@ pagination. Both are explained in the [agent guide](#-agent-guide).
 
 | Tool | Purpose | Arguments |
 | --- | --- | --- |
-| `read_api` | Execute a native read or report/download job; advertising writes are rejected | Required `service`, `operation_name`, `request`; optional `scope` |
-| `write_api` | Preview or execute a native SDK operation that changes account data | Required `service`, `operation_name`, `request`; optional `scope`, `dry_run=true`, `session_id` (required for execution) |
+| `read_api` | Execute a native read or report/download job; advertising writes are rejected | Required `service`, `operation_name`, `request`; optional `scope`, `download_files=false` |
+| `write_api` | Preview or execute a native SDK operation, with supported read-back checks | Required `service`, `operation_name`, `request`; optional `scope`, `dry_run=true`, `session_id` (required for execution), `verify=true`, `preflight=false`, `allow_remove=false` |
 
 Valid service names are `campaign`, `ad_insight`, `reporting`, `bulk`,
 `customer`, and `billing`. Discover operation names such as `update_campaigns`;
@@ -101,7 +107,7 @@ is `false`. See [campaign changes](#campaign-changes) for the complete workflow.
 | `run_report` | Submit a native report once and return its request ID | Required `scope`, `request` |
 | `get_report` | Poll an existing report and download its complete result | Required `scope`, `request_id`; optional `wait_seconds=0` (0–30) |
 | `get_bulk_result` | Poll a bulk download or upload and retrieve complete result/error files | Required `scope`, `request_id`; optional `upload=false` |
-| `upload_bulk_csv` | Preview or upload native bulk CSV, including its Format Version record | Required `scope`, `csv_content`; optional `dry_run=true`, `session_id` (required for execution) |
+| `upload_bulk_csv` | Preview or upload native bulk CSV, including its Format Version record | Required `scope`, `csv_content`; optional `dry_run=true`, `session_id` (required for execution), `verify=true` |
 
 Bulk downloads start through `read_api` with a discovered `bulk` download
 operation. Retrieve upload results with `get_bulk_result(upload=true)`.
@@ -124,8 +130,9 @@ Shopping Content and UET event submission use production endpoints.
 
 | Tool | Purpose | Arguments |
 | --- | --- | --- |
-| `read_csv_rows` | Filter, sort, and page a saved CSV/TSV artifact | Required `artifact`; optional `query` |
-| `read_artifact` | Retrieve exact bytes in base64 chunks | Required `artifact`; optional `offset=0`, `max_bytes=12000` (1–12,000) |
+| `read_csv_rows` | Filter, sort, project, and page a saved CSV/TSV artifact | Required `artifact`; optional `query` |
+| `read_json_artifact` | Read JSON values or page arrays using a JSON Pointer | Required `artifact`; optional `pointer=""`, `query` |
+| `read_artifact` | Retrieve exact bytes in base64 or readable UTF-8 chunks | Required `artifact`; optional `offset=0`, `max_bytes=12000` (1–12,000), `encoding="base64"` or `"utf-8"` |
 
 ## 🚀 Quick Start
 
@@ -281,6 +288,15 @@ settings together.
    `session_id` with each real write. Call `lock_mutation_tools` with that ID
    when finished. Never reuse an unlock from another conversation.
 6. Follow all continuation tokens and job IDs. A first page is not a full dataset.
+7. Request only the report columns and displayed fields needed for the question.
+   Analyze large files locally when possible; avoid passing an entire CSV or base64
+   export through conversation context merely to calculate an aggregate.
+
+Discovery search ignores case and separators: `NegativeKeyword`, `negative_keyword`
+and `negative keyword` find the same operations. `details=true` includes routes and
+documentation; normally inspect only the selected `get_operation_schema`.
+Claude Code's native [MCP Tool Search](https://code.claude.com/docs/en/mcp#scale-with-mcp-tool-search)
+can defer tool schemas; no separate search framework is required here.
 
 MCP arguments use snake_case. Native v13 request bodies use Microsoft's
 PascalCase fields. Content and UET use their own documented JSON shapes.
@@ -330,10 +346,23 @@ Metrics, when supported by that entity's report: `Spend`, `Impressions`,
 fields are listed in `UnavailableMetrics`. Missing performance is not zero.
 Money is in account currency; percentages are percentage points.
 
+Optional `query.fields` selects exact top-level names or dotted paths, for example
+`["Id", "Name", "Performance.Spend"]`. The default returns every field. Unknown
+selections fail instead of silently producing empty columns. A field absent from
+one row stays absent; it is not filled with zero. Full matching rows remain in
+`snapshot_artifact`, even when the displayed rows are projected.
+
+Optional `query.numeric_fields`, such as `["Performance.Spend"]` for entities or
+`["Spend", "Ctr"]` for CSV rows, adds `numeric_values` parallel to `Entities`.
+`"4,716.21"` becomes `4716.21`, `"5.47%"` becomes `5.47` percentage points, and
+`"--"` / `"<10%"` become null rather than invented exact values. Raw cells stay intact.
+Values beyond safe JSON numeric precision are returned as exact decimal strings.
+Nothing is inferred as numeric unless requested; identifier strings retain their zeros.
+
 - If `status` is `Pending`, repeat the same entity call with its returned
   `query` and unchanged scope/entity IDs. Its report IDs resume existing jobs.
 - When `NextPageToken` is present, pass it as `query.next_page_token` with
-  the same filters, sort, scope, and performance settings.
+  the same filters, sort, field selections, scope, and performance settings.
 - `page_size` (1–500) limits the returned page, not source data retrieval.
   `TotalCount` is the number of matching entities.
 - If an entity has `oversized_entity`, retrieve that artifact to see its fields.
@@ -356,8 +385,35 @@ If pending, poll that ID instead of submitting another report.
 Read the returned file `artifact` with `read_csv_rows`, or retrieve exact bytes
 with `read_artifact`. A successful report can contain no data.
 
+`run_report` returns `report_context` and stores it privately for subsequent
+`get_report` calls, including after a server restart. It preserves the requested
+time range, warns when explicit start dates precede known retention windows, and
+lists observed `TimePeriod` extents when the CSV has that column. Retention is
+report/aggregation-specific; unsupported mappings are marked unknown. Cutoffs are
+approximate UTC dates, not guaranteed effective boundaries. The first monthly
+bucket can be partial. `ReturnOnlyCompleteData=true` does not recover expired
+history. An observed first/last bucket cannot prove that every requested day was
+returned, so `effective_range_verified` remains false. See
+[Microsoft's retention table](https://learn.microsoft.com/en-us/advertising/guides/report-data-retention-time-periods?view=bingads-13).
+
 Large JSON responses return `inline_complete=false` and a `complete_result`
-artifact. `read_artifact` returns base64 chunks; follow `next_offset` until null.
+artifact. Use `read_json_artifact` with a pointer such as `/data/Campaigns` to
+page an array using the same query options. Large objects list their member
+pointers; entity snapshots keep complete rows at `/rows`. Escape `/` as `~1` and
+`~` as `~0` inside a pointer member name. Metadata, null slots and errors can be
+retrieved separately without reloading every entity. Large scalar values return
+an artifact for byte/text retrieval. Local file tools can also read the returned
+absolute path directly.
+
+For text files, `read_artifact(encoding="utf-8")` avoids base64. Offsets always
+count bytes; follow `next_offset` until null to respect multibyte character
+boundaries. Base64 remains the default for exact binary retrieval. Signed URL
+credentials are redacted from MCP JSON results and errors after downloads use
+the original URL internally; downloaded source files retain their exact bytes.
+For other native reads returning signed file URLs, such as offline-conversion
+reports, set `read_api(download_files=true)` to save files before redaction.
+Downloads enforce the same Microsoft-host allowlist and preserve the API result
+and job ID if a download fails. Poll existing Reporting/Bulk jobs with their helpers.
 Report files and snapshots remain in the private export directory until removed.
 
 ### Campaign Changes
@@ -406,7 +462,46 @@ revoke them. This is a local workflow guard: anyone holding an ID can use it on
 this unauthenticated, single-identity server. It is not multi-user authentication
 or proof of human approval; client approval settings determine when Claude asks.
 
-A preview is local; Microsoft has not validated the request.
+A default preview is local. It checks SDK field names/types and suggests likely
+typos, but Microsoft has not validated business rules. These checks are advisory:
+unknown future fields, derived types, and explicit null slots still pass through
+unchanged. Fix warnings before executing unless the field is intentionally newer
+than the SDK. No schema validator silently edits a request.
+
+`verify=true` reads back `update_campaigns`, `update_ad_groups`, `update_keywords`,
+and campaign/ad-group negative-site sets. `verification` reports each requested
+field as `matched`, `mismatch`, `not_returned`, or `not_checked` (null update rules
+are field-specific). Complete read-back data is saved privately. A mismatch after
+a provider-success response sets `status="verification_mismatch"` and preserves
+`provider_status` and the original `data`. Read failures produce `unverified`
+without hiding an already completed write. Other operations report
+`not_supported`; read those entities manually. Set `verify=false` to opt out,
+for example when independently verifying a large batch. Read-back observes
+current state, not causation; propagation delays and normalization can cause
+mismatches. The server never retries a mutation to make a comparison pass.
+
+For negative-site replacements, preview with `preflight=true` to read the current
+directly assigned list and inspect `replacement_diff`. This is an explicit
+read-only network preflight; normal previews remain local. Execution always reads
+again and requires `allow_remove=true` if any existing sites would be removed or
+the requested list is empty. Send the complete desired list. An incomplete
+preflight blocks execution. Microsoft provides no atomic compare-and-set here;
+another concurrent editor can still change a list between reading and writing.
+
+Bulk uploads retain their source artifact and job context. On completed upload
+polls, `get_bulk_result(upload=true)` verifies existing Campaign rows for
+`Campaign` (name), `Status`, `Budget`, `Bid Adjustment`, `Budget Type`,
+`Tracking Template`, and `Final Url Suffix`. Other records, creates/deletes,
+unmapped columns and `delete_value` semantics remain explicitly unverified.
+Inspect every result row for provider errors even when read-back matches.
+
+For ad-group `AudienceAdsBidAdjustment`, set the request-level
+`UpdateAudienceAdsBidAdjustment=true`; otherwise Microsoft ignores it.
+Campaign-level accepted-but-unchanged audience adjustments were observed in a
+user session, but a universal restriction is unconfirmed. Read back this field
+and do not infer a delivery change from HTTP 200. See
+[UpdateAdGroups](https://learn.microsoft.com/en-us/advertising/campaign-management-service/updateadgroups?view=bingads-13).
+
 `BING_ADS_READ_ONLY=true` is an additional write block that unlocking cannot override.
 Existing clients must restart the server after updating and unlock before sending writes.
 
@@ -464,17 +559,26 @@ A reserved or beta SDK operation remains subject to Microsoft's access restricti
 
 Current limits:
 
-- Live campaign writes have been user-verified through Claude; report delivery
-  and full API coverage remain unverified. Offline tests use mocked provider responses.
+- A user-provided session report verified selected campaign/keyword writes,
+  report downloads, bulk transfers and a Shopping read on an earlier version.
+  Full API coverage and the new behavior are not live-verified. Offline tests use mocks.
 - Generic API and Content calls do not automatically exhaust provider pagination.
   Entity tools implement their own complete configuration/report workflows.
-- Provider URLs returned by unrelated operations are not automatically downloaded.
-  File-transfer helpers currently cover Reporting and Bulk.
+- Reporting/Bulk helpers download complete results. Other native reads can opt
+  into signed Microsoft file delivery with `read_api(download_files=true)`;
+  arbitrary external hosts and unsigned unrelated URLs are not fetched.
 - The local server does not host Hotel Center XML feeds or
   [live pricing callbacks](https://learn.microsoft.com/en-us/advertising/query-message/live-query),
   install website UET scripts, or transfer catalog feeds over FTP/SFTP.
 - Specialized analysis workflows are composed by the agent from native reports.
   Explicit mutation sessions, default previews, and the global read-only setting are implemented.
+- SDK schemas do not encode every service rule. The server explicitly catches
+  the one-ID limit on `get_negative_keywords_by_entity_ids` and missing
+  `StartDateUtc`/`EndDateUtc` on `get_offline_conversion_reports`. Other business
+  rules remain Microsoft's responsibility. Goal flags use comma-and-space
+  separated names; `InStoreTransaction` requires pilot eligibility and is never
+  silently removed from an explicit request. A null import-job result does not
+  establish that no UI-scheduled imports exist.
 - UET key retrieval follows the SDK and the operation reference:
   `UetTagId` / `UetTagAuthKey`. The CAPI guide currently shows different names;
   the adapter does not guess by retrying a write.
@@ -484,6 +588,9 @@ Current limits:
 Full public API support remains the project goal. Features outside the SDK and
 multi-step workflows need their own coverage checks; they are not considered
 complete merely because the catalog contains their setup operations.
+
+See [the usage-report follow-up](docs/usage-report-follow-up.md) for the complete
+finding-by-finding disposition and verification limits.
 
 References: [Microsoft Advertising overview](https://learn.microsoft.com/en-us/advertising/guides/?view=bingads-13),
 [REST SDK migration](https://learn.microsoft.com/en-us/advertising/guides/python-sdk-migration-soap-to-rest?view=bingads-13),
@@ -501,9 +608,15 @@ bing_ads_mcp/
 ├── catalog.py       # SDK operation/model discovery
 ├── policy.py        # Reviewed read/job allowlists; other operations are writes
 ├── client.py        # Shared native API calls and provider errors
+├── validation.py    # Advisory SDK checks and reviewed operation hints
+├── mutations.py     # Read-back comparisons and negative-site replacement guards
+├── bulk_verification.py # Reviewed bulk Campaign field mappings
 ├── entities.py      # Seven entity workflows and performance joins
 ├── transfers.py     # Report and bulk jobs, downloads, CSV handling
+├── reporting.py     # Retention hints and persisted report coverage context
 ├── artifacts.py     # Complete private artifacts and snapshot pagination
+├── views.py         # Explicit projections and precision-aware numeric views
+├── privacy.py       # URL credential redaction at the output boundary
 ├── content.py       # Shopping Content API
 ├── conversions.py   # UET Conversions API
 └── models.py        # Account scope and shared query inputs
@@ -543,7 +656,7 @@ Direct dependencies are pinned in [pyproject.toml](pyproject.toml); development
 uses [uv.lock](uv.lock). GitHub `uvx` installation resolves package dependencies;
 it does not apply the repository's development lockfile.
 
-Offline tests cover API behavior, MCP discovery of all 24 tools, and mutation
+Offline tests cover API behavior, MCP discovery of all 25 tools, and mutation
 locking on legacy and modern clients, including separate stdio requests.
 These checks do not establish live provider behavior.
 

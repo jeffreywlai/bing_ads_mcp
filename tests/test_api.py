@@ -237,7 +237,8 @@ async def test_real_fastmcp_client_discovery_validation_and_write_guard(api):
             "unlock_mutation_tools",
             "lock_mutation_tools",
         } <= names
-        assert len(names) == 24
+        assert "read_json_artifact" in names
+        assert len(names) == 25
         preview = await mcp.call_tool(
             "write_api",
             {
@@ -315,7 +316,11 @@ async def test_every_mutation_requires_unlock_and_stops_after_relock(
             request = {**arguments, "dry_run": False, "session_id": session_id}
             executed = await mcp.call_tool(tool, request)
             assert executed.data["sent"] is True
-            expected_calls = 2 if tool in {"upload_bulk_csv", "submit_uet_events"} else 1
+            expected_calls = 1 if tool == "content_api" else 2
+            if tool == "write_api":
+                assert executed.data["verification"]["status"] == "unverified"
+                # Exactly one mutation and one read-back, never a repeated mutation.
+                assert sum(url.endswith("/Campaigns") for _, url, _ in campaign_calls) == 1
             assert len(campaign_calls) + len(bulk_calls) + len(http_calls) == expected_calls
             token_calls = token.call_count
 
@@ -370,12 +375,12 @@ async def test_unlock_is_explicit_independent_and_does_not_survive_server_restar
         )
         assert denied.is_error and not sent
         executed = await second.call_tool("write_api", {**request, "session_id": two})
-        assert executed.data["sent"] is True and len(sent) == 1
+        assert executed.data["sent"] is True and len(sent) == 2
     async with Client(create_server(api.settings, api)) as restarted:
         denied = await restarted.call_tool(
             "write_api", {**request, "session_id": two}, raise_on_error=False
         )
-        assert denied.is_error and len(sent) == 1
+        assert denied.is_error and len(sent) == 2
 
 
 async def test_reads_and_report_jobs_work_while_locked_and_read_api_cannot_bypass_it(

@@ -12,6 +12,7 @@ from .artifacts import Artifacts
 from .catalog import models, operation
 from .client import AdsClient, ApiError
 from .models import EntityQuery, Scope
+from .reporting import request_context
 from .transfers import csv_rows, poll_report, submit_report
 
 REPORTS = {
@@ -370,7 +371,7 @@ async def performance(
                 "Time": query.performance_time,
                 "Columns": [id_field, *mapping.values()],
             }
-            sent = await submit_report(client, account_scope, request)
+            sent = await submit_report(client, account_scope, request, artifacts)
             report_ids[account_id] = sent["data"]["ReportRequestId"]
         response = await poll_report(client, artifacts, account_scope, report_ids[account_id])
         if response["status"] == "Pending":
@@ -425,10 +426,41 @@ async def get_entities(
             sort_keys=True,
         ).encode()
     ).hexdigest()
+    context = (
+        request_context(
+            {
+                "Type": REPORTS[kind][0] + "PerformanceReportRequest",
+                "Time": query.performance_time,
+                "Aggregation": "Summary",
+            }
+        )
+        if query.performance_time
+        else None
+    )
+    notices = {"report_context": context} if context and context["warnings"] else {}
     if query.next_page_token:
-        return artifacts.entity_page(None, fingerprint, query.page_size, query.next_page_token)
+        return {
+            **notices,
+            **artifacts.entity_page(
+                None,
+                fingerprint,
+                query.page_size,
+                query.next_page_token,
+                fields=query.fields,
+                numeric_fields=query.numeric_fields,
+            ),
+        }
     rows = await configuration(client, kind, scope, campaign_id, ad_group_id)
     pending = await performance(client, artifacts, kind, rows, scope, query)
     if pending:
-        return pending
-    return artifacts.entity_page(filter_sort(rows, query), fingerprint, query.page_size)
+        return {**notices, **pending}
+    return {
+        **notices,
+        **artifacts.entity_page(
+            filter_sort(rows, query),
+            fingerprint,
+            query.page_size,
+            fields=query.fields,
+            numeric_fields=query.numeric_fields,
+        ),
+    }

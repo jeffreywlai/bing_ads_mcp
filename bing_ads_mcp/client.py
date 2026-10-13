@@ -13,11 +13,15 @@ from urllib3.exceptions import HTTPError
 from .auth import OAuth, Settings
 from .catalog import SERVICES, operation
 from .models import Scope
+from .privacy import safe_output
+from .validation import operation_hints, request_constraints, request_issues
 
 
 class ApiError(ToolError):
     def __init__(self, message: str, *, unknown: bool = False, **details):
-        self.details = {"message": message, "mutation_outcome_unknown": unknown, **details}
+        self.details = safe_output(
+            {"message": message, "mutation_outcome_unknown": unknown, **details}
+        )
         super().__init__(json.dumps(self.details, ensure_ascii=False))
 
 
@@ -138,6 +142,33 @@ class AdsClient:
             json.dumps(body, allow_nan=False)
         except TypeError, ValueError:
             raise ApiError("Request must contain finite JSON values.") from None
+        if problem := request_constraints(service, name, body):
+            raise ApiError(problem, **operation_hints(service, name))
+        issues = request_issues(service, op.model, body)
+        groups = body.get("AdGroups")
+        groups = groups if isinstance(groups, list) else []
+        if name == "update_ad_groups" and body.get("UpdateAudienceAdsBidAdjustment") is not True:
+            if any(isinstance(row, dict) and "AudienceAdsBidAdjustment" in row for row in groups):
+                issues.append(
+                    {
+                        "path": "UpdateAudienceAdsBidAdjustment",
+                        "issue": "Set this flag to true to update AudienceAdsBidAdjustment; "
+                        "Microsoft otherwise ignores the field.",
+                    }
+                )
+        campaigns = body.get("Campaigns")
+        campaigns = campaigns if isinstance(campaigns, list) else []
+        if name in {"update_campaigns", "update_ad_groups"} and any(
+            isinstance(row, dict) and "AudienceAdsBidAdjustment" in row
+            for row in campaigns + groups
+        ):
+            issues.append(
+                {
+                    "path": "AudienceAdsBidAdjustment",
+                    "issue": "Read back this field: accepted-but-unchanged updates were observed "
+                    "in a user session. This is not confirmed as a universal API restriction.",
+                }
+            )
         return {
             **op.describe(),
             "environment": self.settings.environment,
@@ -145,7 +176,10 @@ class AdsClient:
             "request": body,
             "dry_run": True,
             "sent": False,
-            "validation": "Local preview only. Microsoft has not validated this request.",
+            "validation": "Local SDK field/type checks are advisory. Microsoft has not "
+            "validated this request. Native fields are sent unchanged.",
+            **({"warnings": issues} if issues else {}),
+            **operation_hints(service, name),
         }
 
     async def execute(
@@ -189,18 +223,27 @@ class AdsClient:
                 retryable=op.effect == "read",
             ) from None
         auth = headers["Authorization"].removeprefix("Bearer ")
-        output = result(
-            status,
-            response_headers,
-            raw,
-            effect=op.effect,
-            secrets=(
-                auth,
-                self.settings.developer_token,
-                self.settings.client_secret,
-                self.settings.refresh_token,
-            ),
-        )
+        try:
+            output = result(
+                status,
+                response_headers,
+                raw,
+                effect=op.effect,
+                secrets=(
+                    auth,
+                    self.settings.developer_token,
+                    self.settings.client_secret,
+                    self.settings.refresh_token,
+                ),
+            )
+        except ApiError as exc:
+            hints = operation_hints(service, name)
+            if hints:
+                details = dict(exc.details)
+                message = details.pop("message")
+                unknown = details.pop("mutation_outcome_unknown")
+                raise ApiError(message, unknown=unknown, **details, **hints) from None
+            raise
         return {
             "service": service,
             "operation": name,
@@ -208,4 +251,6 @@ class AdsClient:
             "dry_run": False,
             "sent": True,
             **output,
+            **({"warnings": preview["warnings"]} if "warnings" in preview else {}),
+            **operation_hints(service, name),
         }
