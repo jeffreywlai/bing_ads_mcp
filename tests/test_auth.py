@@ -11,6 +11,44 @@ import pytest
 from bing_ads_mcp import auth
 
 
+def test_credentials_are_shared_across_launch_directories(tmp_path, monkeypatch):
+    private_home = tmp_path / "analyst-home"
+    private_home.mkdir()
+    monkeypatch.setattr(auth.Path, "home", lambda: private_home)
+    for name in ("TOKEN_FILE", "EXPORT_DIR", "ENVIRONMENT", "READ_ONLY"):
+        monkeypatch.delenv(f"BING_ADS_{name}", raising=False)
+    login_dir = tmp_path / "login-project"
+    server_dir = tmp_path / "different-project"
+    login_dir.mkdir()
+    server_dir.mkdir()
+    monkeypatch.chdir(login_dir)
+    login_settings = auth.Settings.from_env()
+    auth.save_token(login_settings, "test-refresh-token")
+    monkeypatch.chdir(server_dir)
+    server_settings = auth.Settings.from_env()
+    assert server_settings.token_file == private_home / ".bing-ads/token.json"
+    assert server_settings.export_dir == private_home / ".bing-ads/exports"
+    assert auth.Settings().token_file == server_settings.token_file
+    assert (
+        json.loads(server_settings.token_file.read_text())["refresh_token"] == "test-refresh-token"
+    )
+    assert not (login_dir / ".bing-ads").exists()
+    assert not (server_dir / ".bing-ads").exists()
+
+
+@pytest.mark.parametrize("location", ["~/private-bing", "relative-private-bing"])
+def test_explicit_credential_paths_are_preserved(tmp_path, monkeypatch, location):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BING_ADS_TOKEN_FILE", location + "/token.json")
+    monkeypatch.setenv("BING_ADS_EXPORT_DIR", location + "/exports")
+    settings = auth.Settings.from_env()
+    expected = (
+        auth.Path.home() / "private-bing" if location.startswith("~") else auth.Path(location)
+    )
+    assert settings.token_file == expected / "token.json"
+    assert settings.export_dir == expected / "exports"
+
+
 def test_browser_callback_without_copying_code(monkeypatch, capsys):
     opened = []
     monkeypatch.setattr(auth.webbrowser, "open", opened.append)

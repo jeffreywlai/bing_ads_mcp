@@ -1,19 +1,20 @@
 {
   "mcpServers": {
     "BingAds": {
-      "command": "uv",
+      "command": "uvx",
       "args": [
-        "run",
-        "--directory",
-        "/absolute/path/to/bing_ads_mcp",
-        "-m",
-        "bing_ads_mcp.server"
+        "--refresh",
+        "--python",
+        "3.15",
+        "--from",
+        "git+https://github.com/jeffreywlai/bing_ads_mcp.git@main",
+        "bing-ads-mcp"
       ],
       "env": {
         "BING_ADS_CLIENT_ID": "",
         "BING_ADS_DEVELOPER_TOKEN": "",
-        "BING_ADS_TOKEN_FILE": "/absolute/path/to/private/bing-token.json",
-        "BING_ADS_EXPORT_DIR": "/absolute/path/to/private/bing-exports"
+        "BING_ADS_TOKEN_FILE": "~/.bing-ads/token.json",
+        "BING_ADS_EXPORT_DIR": "~/.bing-ads/exports"
       }
     }
   }

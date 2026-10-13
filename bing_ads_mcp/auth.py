@@ -38,8 +38,8 @@ class Settings:
     refresh_token: str = field(default="", repr=False)
     environment: str = "production"
     read_only: bool = False
-    token_file: Path = Path(".bing-ads/token.json")
-    export_dir: Path = Path(".bing-ads/exports")
+    token_file: Path = field(default_factory=lambda: Path.home() / ".bing-ads/token.json")
+    export_dir: Path = field(default_factory=lambda: Path.home() / ".bing-ads/exports")
 
     @classmethod
     def from_env(cls):
@@ -57,8 +57,12 @@ class Settings:
             refresh_token=os.getenv("BING_ADS_REFRESH_TOKEN", ""),
             environment=environment,
             read_only=read_only == "true",
-            token_file=Path(os.getenv("BING_ADS_TOKEN_FILE", ".bing-ads/token.json")),
-            export_dir=Path(os.getenv("BING_ADS_EXPORT_DIR", ".bing-ads/exports")),
+            token_file=Path(
+                os.getenv("BING_ADS_TOKEN_FILE") or Path.home() / ".bing-ads/token.json"
+            ).expanduser(),
+            export_dir=Path(
+                os.getenv("BING_ADS_EXPORT_DIR") or Path.home() / ".bing-ads/exports"
+            ).expanduser(),
         )
 
 
