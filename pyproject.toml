@@ -1,7 +1,7 @@
 [project]
 name = "bing-ads-mcp"
 version = "0.1.0"
-description = "A small Microsoft Advertising REST v13 MCP server for reports and campaign changes."
+description = "Microsoft Advertising MCP: SDK-wide API access, reports, and campaign changes."
 readme = "README.md"
 requires-python = ">=3.15"
 license = "MIT"
@@ -18,6 +18,7 @@ dev = ["pytest==9.1.1", "pytest-asyncio==1.4.0", "ruff==0.17.0"]
 
 [project.scripts]
 bing-ads-login = "bing_ads_mcp.auth:main"
+bing-ads-mcp = "bing_ads_mcp.server:main"
 
 [build-system]
 requires = ["setuptools==84.0.0"]

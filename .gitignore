@@ -10,4 +10,5 @@ dist/
 .env.*
 !.env.example
 .bing-ads/
+.mcp.json
 .DS_Store

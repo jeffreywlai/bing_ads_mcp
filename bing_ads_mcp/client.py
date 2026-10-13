@@ -1,125 +1,211 @@
-"""One explicit REST boundary. No arbitrary URLs, shared mutable scope, or write retries."""
+"""One authenticated execution boundary for every v13 API operation."""
 
 import asyncio
 import json
-import re
 
 import httpx
+from fastmcp.exceptions import ToolError
+from openapi_client.api_client import ApiClient
+from openapi_client.configuration import Configuration
+from openapi_client.exceptions import ApiException
+from urllib3.exceptions import HTTPError
 
 from .auth import OAuth, Settings
+from .catalog import SERVICES, operation
 from .models import Scope
 
-SERVICES = {
-    "campaign": ("campaign", "CampaignManagement"),
-    "customer": ("clientcenter", "CustomerManagement"),
-    "reporting": ("reporting", "Reporting"),
-}
 
-
-class ApiError(ValueError):
-    """A sanitized, actionable error suitable for an MCP result."""
-
+class ApiError(ToolError):
     def __init__(self, message: str, *, unknown: bool = False, **details):
         self.details = {"message": message, "mutation_outcome_unknown": unknown, **details}
-        super().__init__(json.dumps(self.details))
+        super().__init__(json.dumps(self.details, ensure_ascii=False))
 
 
-def error_details(body: object) -> list[dict]:
-    """Keep codes and batch indices; provider messages can echo tokens and input data."""
-    result = []
-    if isinstance(body, list):
-        for item in body:
-            result.extend(error_details(item))
-    elif isinstance(body, dict):
-        if "Code" in body or "ErrorCode" in body:
-            result.append({
-                key: value for key, value in body.items()
-                if key in {"Code", "ErrorCode", "Index", "FieldPath"}
-                and re.fullmatch(r"[A-Za-z0-9_.\[\]-]{1,120}", str(value))
-            })
-        else:
-            for key in ("Errors", "OperationErrors", "BatchErrors", "PartialErrors", "Error", "ApiFault"):
-                result.extend(error_details(body.get(key)))
-    return result[:100]
+def redact(value, secrets: tuple[str, ...]):
+    if isinstance(value, str):
+        for secret in secrets:
+            if secret:
+                value = value.replace(secret, "[REDACTED]")
+        return value
+    if isinstance(value, list):
+        return [redact(item, secrets) for item in value]
+    if isinstance(value, dict):
+        return {k: redact(v, secrets) for k, v in value.items()}
+    return value
+
+
+def has_errors(value) -> bool:
+    if isinstance(value, dict):
+        return any(
+            any(v) if isinstance(v, list) else bool(v)
+            for k, v in value.items()
+            if k in {"PartialErrors", "BatchErrors", "OperationErrors", "Errors", "errors"}
+        )
+    return False
+
+
+def result(
+    status: int, headers: dict, raw: bytes, *, effect: str, secrets=(), partial: bool = False
+) -> dict:
+    """Keep raw provider fields, nested partial errors, indices, and tracking IDs."""
+    tracking = next(
+        (v for k, v in headers.items() if k.lower() in {"trackingid", "webrequestactivityid"}), None
+    )
+    try:
+        body = json.loads(raw) if raw else {}
+    except ValueError, UnicodeError:
+        raise ApiError(
+            "Microsoft returned a non-JSON response. Verify state before retrying.",
+            unknown=effect != "read",
+            http_status=status,
+            tracking_id=tracking,
+        ) from None
+    body = redact(body, secrets)
+    if (
+        not 200 <= status < 300
+        or not isinstance(body, dict)
+        or not partial
+        and any(
+            any(body[k]) if isinstance(body.get(k), list) else bool(body.get(k))
+            for k in ("OperationErrors", "Errors", "error", "ApiFault", "ApplicationFault")
+        )
+    ):
+        raise ApiError(
+            "Microsoft Advertising rejected or could not complete the request.",
+            unknown=effect != "read" and (status >= 500 or status in {408, 429}),
+            http_status=status,
+            tracking_id=tracking,
+            provider_response=body,
+        )
+    return {
+        "status": "partial_failure" if partial or has_errors(body) else "returned",
+        "data": body,
+        "tracking_id": tracking,
+        "mutation_outcome_unknown": False,
+    }
 
 
 class AdsClient:
     def __init__(self, settings: Settings, http: httpx.AsyncClient):
         self.settings, self.http = settings, http
         self.oauth = OAuth(settings, http)
+        self.clients = {}
+        for service, (_, host, _) in SERVICES.items():
+            sandbox = ".sandbox" if settings.environment == "sandbox" else ""
+            config = Configuration(
+                host=f"https://{host}.api{sandbox}.bingads.microsoft.com", retries=0, debug=False
+            )
+            self.clients[service] = ApiClient(config)
 
-    async def request(
-        self, service: str, path: str, body: dict, *, scope: Scope | None = None,
-        method: str = "POST", mutation: bool = False, retry: bool = True,
-    ) -> dict:
-        if mutation and self.settings.read_only:
-            raise ApiError("Advertising writes are disabled by BING_ADS_READ_ONLY.")
+    def close(self):
+        for client in self.clients.values():
+            client.rest_client.pool_manager.clear()
+
+    async def headers(self, scope: Scope | None, *, legacy: bool = False) -> dict:
         if not self.settings.developer_token:
             raise ApiError("Set BING_ADS_DEVELOPER_TOKEN before making API calls.")
-        if scope and "AccountId" in body and str(body["AccountId"]) != scope.account_id:
-            raise ApiError("AccountId does not match the account scope.")
-        host, namespace = SERVICES[service]
-        sandbox = ".sandbox" if self.settings.environment == "sandbox" else ""
-        url = f"https://{host}.api{sandbox}.bingads.microsoft.com/{namespace}/v13/{path}"
+        try:
+            token = await self.oauth.access_token()
+        except (ValueError, OSError) as exc:
+            raise ApiError(
+                str(exc)
+                if isinstance(exc, ValueError)
+                else "Could not persist OAuth tokens. Check token file permissions."
+            ) from None
         headers = {
-            "Authorization": f"Bearer {await self.oauth.access_token()}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
             "DeveloperToken": self.settings.developer_token,
         }
+        headers["AuthenticationToken" if legacy else "Authorization"] = (
+            token if legacy else f"Bearer {token}"
+        )
         if scope:
             headers.update(CustomerId=scope.customer_id, CustomerAccountId=scope.account_id)
-        attempts = 3 if retry and not mutation else 1
-        for attempt in range(attempts):
-            try:
-                response = await self.http.request(method, url, json=body, headers=headers, timeout=30)
-            except httpx.HTTPError:
-                if attempt + 1 < attempts:
-                    await asyncio.sleep(2**attempt)
-                    continue
-                raise ApiError(
-                    "Transport failed. Read current entity state before retrying a write.",
-                    unknown=mutation, retryable=not mutation,
-                ) from None
-            try:
-                data = response.json()
-            except ValueError:
-                data = None
-            transient = response.status_code in {408, 429, 500, 502, 503, 504}
-            errors = error_details(data)
-            throttled = any(str(e.get("Code")) == "117" for e in errors)
-            if transient and not errors and attempt + 1 < attempts:
-                delay = response.headers.get("Retry-After", "")
-                if not delay or (delay.isdigit() and int(delay) <= 10):
-                    await asyncio.sleep(int(delay) if delay.isdigit() else 2**attempt)
-                    continue
-            if response.is_error or not isinstance(data, dict) or any(
-                data.get(key) for key in ("Errors", "OperationErrors", "BatchErrors", "ApiFault")
-            ):
-                raise ApiError(
-                    "Microsoft Advertising request failed; inspect error codes and TrackingId.",
-                    unknown=mutation and (transient or not isinstance(data, dict)),
-                    http_status=response.status_code, errors=errors,
-                    retryable=(transient or throttled) and not mutation,
-                    retry_after_seconds=60 if throttled else None,
-                    tracking_id=response.headers.get("TrackingId"),
-                )
-            return {**data, "TrackingId": response.headers.get("TrackingId") or data.get("TrackingId")}
-        raise AssertionError("unreachable")
+        return headers
 
-    async def change(self, path: str, body: dict, scope: Scope, dry_run: bool) -> dict:
-        if self.settings.read_only:
-            raise ApiError("Advertising writes are disabled by BING_ADS_READ_ONLY.")
-        if dry_run:
-            return {
-                "dry_run": True, "applied": False, "scope": scope.model_dump(),
-                "method": "PUT", "operation": path, "request": body,
-                "validation": "Local validation only; Microsoft has not validated this request.",
-            }
-        data = await self.request("campaign", path, body, scope=scope, method="PUT", mutation=True)
-        if "PartialErrors" not in data:
-            raise ApiError("Write response is missing PartialErrors. Verify entity state.", unknown=True)
-        errors = error_details(data["PartialErrors"])
+    def preview(self, service: str, name: str, body: dict, scope: Scope | None) -> dict:
+        op = operation(service, name)
+        if service in {"campaign", "ad_insight", "reporting", "bulk"} and scope is None:
+            raise ApiError("This service requires an explicit customer/account scope.")
+        if (
+            scope
+            and body.get("AccountId") is not None
+            and str(body["AccountId"]) != scope.account_id
+        ):
+            raise ApiError("AccountId must match scope.account_id.")
+        try:
+            json.dumps(body, allow_nan=False)
+        except TypeError, ValueError:
+            raise ApiError("Request must contain finite JSON values.") from None
         return {
-            "dry_run": False, "all_succeeded": not bool(data["PartialErrors"]),
-            "partial_errors": errors, "tracking_id": data["TrackingId"],
-            "guidance": "Failed indices refer to the submitted array. Re-read before retrying.",
+            **op.describe(),
+            "environment": self.settings.environment,
+            "scope": scope.model_dump() if scope else None,
+            "request": body,
+            "dry_run": True,
+            "sent": False,
+            "validation": "Local preview only. Microsoft has not validated this request.",
+        }
+
+    async def execute(
+        self,
+        service: str,
+        name: str,
+        body: dict,
+        scope: Scope | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> dict:
+        preview = self.preview(service, name, body, scope)
+        op = operation(service, name)
+        if dry_run:
+            return preview
+        if op.effect == "write" and self.settings.read_only:
+            raise ApiError("Advertising writes are disabled by BING_ADS_READ_ONLY.")
+        headers = await self.headers(scope)
+        client = self.clients[service]
+
+        def send():
+            params = client.param_serialize(
+                op.method, op.path, header_params=headers, body=body, auth_settings=[]
+            )
+            response = client.call_api(*params, _request_timeout=(10.0, 60.0))
+            try:
+                raw = response.read()
+                # Some SDK versions set .data and return None from read().
+                return response.status, dict(response.getheaders()), response.data or raw or b""
+            finally:
+                response.response.close()
+                response.response.release_conn()
+
+        try:
+            status, response_headers, raw = await asyncio.to_thread(send)
+        except HTTPError, ApiException, OSError:
+            raise ApiError(
+                "Transport failed. No automatic retry was attempted. "
+                "Read current state before repeating a write or job submission.",
+                unknown=op.effect != "read",
+                retryable=op.effect == "read",
+            ) from None
+        auth = headers["Authorization"].removeprefix("Bearer ")
+        output = result(
+            status,
+            response_headers,
+            raw,
+            effect=op.effect,
+            secrets=(
+                auth,
+                self.settings.developer_token,
+                self.settings.client_secret,
+                self.settings.refresh_token,
+            ),
+        )
+        return {
+            "service": service,
+            "operation": name,
+            "effect": op.effect,
+            "dry_run": False,
+            "sent": True,
+            **output,
         }

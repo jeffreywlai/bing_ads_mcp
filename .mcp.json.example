@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "BingAds": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/absolute/path/to/bing_ads_mcp",
+        "-m",
+        "bing_ads_mcp.server"
+      ],
+      "env": {
+        "BING_ADS_CLIENT_ID": "",
+        "BING_ADS_DEVELOPER_TOKEN": "",
+        "BING_ADS_TOKEN_FILE": "/absolute/path/to/private/bing-token.json",
+        "BING_ADS_EXPORT_DIR": "/absolute/path/to/private/bing-exports"
+      }
+    }
+  }
+}
