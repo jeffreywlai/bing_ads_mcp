@@ -1,11 +1,14 @@
 import inspect
 import json
+import sys
 from collections import Counter
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from fastmcp import Client
+from fastmcp.client.transports import StdioTransport
 from urllib3 import HTTPResponse
 from urllib3.exceptions import ReadTimeoutError
 
@@ -17,6 +20,27 @@ from bing_ads_mcp.policy import JOBS, READS
 from bing_ads_mcp.server import create_server
 
 SCOPE = Scope(customer_id="123", account_id="456")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MUTATIONS = [
+    (
+        "write_api",
+        {
+            "service": "campaign",
+            "operation_name": "update_campaigns",
+            "request": {"AccountId": "456", "Campaigns": [{"Id": "789", "Status": "Paused"}]},
+        },
+    ),
+    (
+        "upload_bulk_csv",
+        {
+            "csv_content": (
+                "Type,Status,Id,Parent Id,Name\nFormat Version,,,,6.0\nCampaign,Paused,789,456,\n"
+            )
+        },
+    ),
+    ("content_api", {"operation_name": "insert_product", "merchant_id": "123", "request": {}}),
+    ("submit_uet_events", {"tag_id": "123", "request": {"data": [{"eventId": "test-event"}]}}),
+]
 
 
 def test_catalog_covers_every_public_sdk_operation():
@@ -210,7 +234,10 @@ async def test_real_fastmcp_client_discovery_validation_and_write_guard(api):
             "get_asset_groups",
             "get_audience_associations",
             "write_api",
+            "unlock_mutation_tools",
+            "lock_mutation_tools",
         } <= names
+        assert len(names) == 24
         preview = await mcp.call_tool(
             "write_api",
             {
@@ -245,6 +272,199 @@ async def test_real_fastmcp_client_discovery_validation_and_write_guard(api):
         )
         assert unknown.is_error
         assert "Use list_models" in unknown.content[0].text
+
+
+@pytest.mark.parametrize("tool,arguments", MUTATIONS)
+@pytest.mark.parametrize("mode", ["legacy", "2026-07-28"])
+async def test_every_mutation_requires_unlock_and_stops_after_relock(
+    api, monkeypatch, tool, arguments, mode
+):
+    token = AsyncMock(return_value="access-secret")
+    monkeypatch.setattr(api.oauth, "access_token", token)
+    campaign_calls = transport(api, monkeypatch, "campaign", {"UetTagAuthKey": "uet-secret"})
+    bulk_calls = transport(
+        api,
+        monkeypatch,
+        "bulk",
+        {"UploadUrl": "https://bulk.api.bingads.microsoft.com/upload", "RequestId": "job"},
+    )
+    http_calls = []
+
+    def respond(request):
+        http_calls.append(request)
+        return httpx.Response(200, json={"eventsReceived": 1})
+
+    arguments = {"scope": SCOPE.model_dump(), **arguments}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        monkeypatch.setattr(api, "http", http)
+        async with Client(create_server(api.settings, api), mode=mode) as mcp:
+            preview = await mcp.call_tool(tool, arguments)
+            assert preview.data["sent"] is False
+            for session in ({}, {"session_id": "unminted-session"}):
+                denied = await mcp.call_tool(
+                    tool, {**arguments, "dry_run": False, **session}, raise_on_error=False
+                )
+                assert denied.is_error
+                assert "writes are locked" in denied.content[0].text
+            token.assert_not_called()
+            assert not campaign_calls and not bulk_calls and not http_calls
+
+            unlocked = await mcp.call_tool("unlock_mutation_tools", {})
+            assert unlocked.data["mutation_tools_unlocked"] is True
+            session_id = unlocked.data["session_id"]
+            request = {**arguments, "dry_run": False, "session_id": session_id}
+            executed = await mcp.call_tool(tool, request)
+            assert executed.data["sent"] is True
+            expected_calls = 2 if tool in {"upload_bulk_csv", "submit_uet_events"} else 1
+            assert len(campaign_calls) + len(bulk_calls) + len(http_calls) == expected_calls
+            token_calls = token.call_count
+
+            for _ in range(2):
+                locked = await mcp.call_tool("lock_mutation_tools", {"session_id": session_id})
+                assert locked.data == {"mutation_tools_unlocked": False}
+            denied = await mcp.call_tool(tool, request, raise_on_error=False)
+            assert denied.is_error
+            assert "writes are locked" in denied.content[0].text
+            assert token.call_count == token_calls
+            assert len(campaign_calls) + len(bulk_calls) + len(http_calls) == expected_calls
+
+
+@pytest.mark.parametrize("tool,arguments", MUTATIONS)
+async def test_read_only_cannot_be_overridden_by_unlock(api, monkeypatch, tool, arguments):
+    from dataclasses import replace
+
+    settings = replace(api.settings, read_only=True)
+    monkeypatch.setattr(api, "settings", settings)
+    token = AsyncMock(side_effect=AssertionError("Blocked writes must not authenticate"))
+    monkeypatch.setattr(api.oauth, "access_token", token)
+    async with Client(create_server(settings, api)) as mcp:
+        denied = await mcp.call_tool("unlock_mutation_tools", {}, raise_on_error=False)
+        assert denied.is_error
+        assert "BING_ADS_READ_ONLY" in denied.content[0].text
+        arguments = {"scope": SCOPE.model_dump(), **arguments}
+        preview = await mcp.call_tool(tool, arguments)
+        assert preview.data["sent"] is False
+        denied = await mcp.call_tool(
+            tool,
+            {**arguments, "dry_run": False, "session_id": "cannot-override-read-only"},
+            raise_on_error=False,
+        )
+        assert denied.is_error
+        assert "BING_ADS_READ_ONLY" in denied.content[0].text
+        token.assert_not_called()
+
+
+async def test_unlock_is_explicit_independent_and_does_not_survive_server_restart(api, monkeypatch):
+    sent = transport(api, monkeypatch, "campaign", {})
+    request = {"scope": SCOPE.model_dump(), **MUTATIONS[0][1], "dry_run": False}
+    server = create_server(api.settings, api)
+    async with Client(server) as first, Client(server) as second:
+        one = (await first.call_tool("unlock_mutation_tools", {})).data["session_id"]
+        denied = await second.call_tool("write_api", request, raise_on_error=False)
+        assert denied.is_error and not sent
+        two = (await second.call_tool("unlock_mutation_tools", {})).data["session_id"]
+        assert one != two
+        await first.call_tool("lock_mutation_tools", {"session_id": one})
+        denied = await first.call_tool(
+            "write_api", {**request, "session_id": one}, raise_on_error=False
+        )
+        assert denied.is_error and not sent
+        executed = await second.call_tool("write_api", {**request, "session_id": two})
+        assert executed.data["sent"] is True and len(sent) == 1
+    async with Client(create_server(api.settings, api)) as restarted:
+        denied = await restarted.call_tool(
+            "write_api", {**request, "session_id": two}, raise_on_error=False
+        )
+        assert denied.is_error and len(sent) == 1
+
+
+async def test_reads_and_report_jobs_work_while_locked_and_read_api_cannot_bypass_it(
+    api, monkeypatch
+):
+    campaign_calls = transport(api, monkeypatch, "campaign", {"Campaigns": []})
+    report_calls = transport(api, monkeypatch, "reporting", {"ReportRequestId": "report"})
+    async with Client(create_server(api.settings, api)) as mcp:
+        read = await mcp.call_tool(
+            "read_api",
+            {
+                "service": "campaign",
+                "operation_name": "get_campaigns_by_account_id",
+                "request": {"AccountId": "456", "CampaignType": "Search"},
+                "scope": SCOPE.model_dump(),
+            },
+        )
+        assert read.data["data"] == {"Campaigns": []}
+        report = await mcp.call_tool(
+            "run_report",
+            {
+                "scope": SCOPE.model_dump(),
+                "request": {"Type": "CampaignPerformanceReportRequest"},
+            },
+        )
+        assert report.data["data"]["ReportRequestId"] == "report"
+        for service, name in operations():
+            if operation(service, name).effect == "write":
+                rejected = await mcp.call_tool(
+                    "read_api",
+                    {
+                        "service": service,
+                        "operation_name": name,
+                        "request": {},
+                        "scope": SCOPE.model_dump(),
+                    },
+                    raise_on_error=False,
+                )
+                assert rejected.is_error
+                assert "Use write_api" in rejected.content[0].text
+        assert len(campaign_calls) == len(report_calls) == 1
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_content_reads_work_while_locked(api, monkeypatch, dry_run):
+    sent = []
+
+    def respond(request):
+        sent.append(request)
+        return httpx.Response(200, json={"resources": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        monkeypatch.setattr(api, "http", http)
+        async with Client(create_server(api.settings, api)) as mcp:
+            result = await mcp.call_tool(
+                "content_api",
+                {"operation_name": "list_products", "merchant_id": "123", "dry_run": dry_run},
+            )
+            assert result.data["data"] == {"resources": []}
+            assert len(sent) == 1 and sent[0].method == "GET"
+
+
+@pytest.mark.parametrize("mode", ["legacy", "2026-07-28"])
+async def test_mutation_session_survives_separate_stdio_requests(tmp_path, mode):
+    script = (
+        "from pathlib import Path\n"
+        "from bing_ads_mcp.auth import Settings\n"
+        "from bing_ads_mcp.server import create_server\n"
+        "create_server(Settings(export_dir=Path('exports'))).run(show_banner=False)\n"
+    )
+    transport = StdioTransport(
+        sys.executable,
+        ["-c", script],
+        env={"PYTHONPATH": str(PROJECT_ROOT)},
+        cwd=str(tmp_path),
+    )
+    request = {"scope": SCOPE.model_dump(), **MUTATIONS[0][1], "dry_run": False}
+    async with Client(transport, mode=mode) as mcp:
+        denied = await mcp.call_tool("write_api", request, raise_on_error=False)
+        assert denied.is_error and "writes are locked" in denied.content[0].text
+        session_id = (await mcp.call_tool("unlock_mutation_tools", {})).data["session_id"]
+        request["session_id"] = session_id
+        # No credentials: reaching this error proves the unlock survived a new request,
+        # without allowing this protocol test to contact Microsoft.
+        permitted = await mcp.call_tool("write_api", request, raise_on_error=False)
+        assert permitted.is_error and "Set BING_ADS_DEVELOPER_TOKEN" in permitted.content[0].text
+        await mcp.call_tool("lock_mutation_tools", {"session_id": session_id})
+        denied = await mcp.call_tool("write_api", request, raise_on_error=False)
+        assert denied.is_error and "writes are locked" in denied.content[0].text
 
 
 @pytest.mark.parametrize(

@@ -5,14 +5,14 @@
 [![Microsoft Advertising API v13](https://img.shields.io/badge/Microsoft%20Advertising%20API-v13-blue.svg)](https://learn.microsoft.com/en-us/advertising/guides/?view=bingads-13)
 
 **An MCP server for reading reports and managing Microsoft Advertising accounts —
-22 tools over 290 SDK operations, plus Shopping Content and UET conversion events.**
+24 tools over 290 SDK operations, plus Shopping Content and UET conversion events.**
 
 > Ask Claude to "show my highest-spend campaigns last week" or "preview pausing
 > these campaigns."
 
 **This is not an officially supported Microsoft product.**
 
-[Quick start](#-quick-start) · [Available tools](#-available-tools-22) ·
+[Quick start](#-quick-start) · [Available tools](#-available-tools-24) ·
 [Agent guide](#-agent-guide) · [API coverage](#-api-coverage-and-current-limits)
 
 ## ✨ Features
@@ -32,18 +32,20 @@
   inventory, and catalogs.
 - **Conversion events** — Native UET Conversions API submissions with indexed
   errors and partial results preserved.
-- **Write previews** — Writes default to a local preview. Execution is explicit,
-  mutations are never automatically retried, and a read-only setting blocks writes.
+- **Write lock and previews** — Writes start locked and default to a local preview.
+  Explicitly unlock a mutation session to execute changes, then lock it afterward.
+  Mutations are never automatically retried; the read-only setting blocks unlocking.
 - **Individual sign-in** — Each analyst signs in with their own Microsoft identity;
   refresh tokens stay in a private local file.
 - **Install from GitHub** — Claude launches the published package with `uvx`.
   Analysts do not need a source checkout.
 
-Browser login and offline checks have passed. Live advertising API reads,
-report downloads, and mutations still require end-to-end verification.
+Browser login and offline checks have passed. A user has confirmed successful
+live campaign changes through Claude. Live report downloads and broader API
+coverage still require end-to-end verification.
 See [coverage and current limits](#-api-coverage-and-current-limits).
 
-## 📋 Available Tools (22)
+## 📋 Available Tools (24)
 
 Tool arguments below use the exact registered names. `scope` contains
 `customer_id` and `account_id`; `query` controls entity filters, performance, and
@@ -75,11 +77,22 @@ pagination. Both are explained in the [agent guide](#-agent-guide).
 | Tool | Purpose | Arguments |
 | --- | --- | --- |
 | `read_api` | Execute a native read or report/download job; advertising writes are rejected | Required `service`, `operation_name`, `request`; optional `scope` |
-| `write_api` | Preview or execute a native SDK operation that changes account data | Required `service`, `operation_name`, `request`; optional `scope`, `dry_run=true` |
+| `write_api` | Preview or execute a native SDK operation that changes account data | Required `service`, `operation_name`, `request`; optional `scope`, `dry_run=true`, `session_id` (required for execution) |
 
 Valid service names are `campaign`, `ad_insight`, `reporting`, `bulk`,
 `customer`, and `billing`. Discover operation names such as `update_campaigns`;
 do not pass SOAP-style names such as `UpdateCampaigns` as `operation_name`.
+
+### 🔒 Mutation Sessions
+
+| Tool | Purpose | Arguments |
+| --- | --- | --- |
+| `unlock_mutation_tools` | After user authorization, create an unlocked session and return its ID | None |
+| `lock_mutation_tools` | Revoke that session's permission to send further writes | Required `session_id` |
+
+Reads and local previews need no unlock. Every real write requires the
+`session_id` returned by `unlock_mutation_tools`, even when `BING_ADS_READ_ONLY`
+is `false`. See [campaign changes](#campaign-changes) for the complete workflow.
 
 ### 📊 Reporting and Bulk Transfers
 
@@ -88,7 +101,7 @@ do not pass SOAP-style names such as `UpdateCampaigns` as `operation_name`.
 | `run_report` | Submit a native report once and return its request ID | Required `scope`, `request` |
 | `get_report` | Poll an existing report and download its complete result | Required `scope`, `request_id`; optional `wait_seconds=0` (0–30) |
 | `get_bulk_result` | Poll a bulk download or upload and retrieve complete result/error files | Required `scope`, `request_id`; optional `upload=false` |
-| `upload_bulk_csv` | Preview or upload native bulk CSV, including its Format Version record | Required `scope`, `csv_content`; optional `dry_run=true` |
+| `upload_bulk_csv` | Preview or upload native bulk CSV, including its Format Version record | Required `scope`, `csv_content`; optional `dry_run=true`, `session_id` (required for execution) |
 
 Bulk downloads start through `read_api` with a discovered `bulk` download
 operation. Retrieve upload results with `get_bulk_result(upload=true)`.
@@ -98,8 +111,8 @@ operation. Retrieve upload results with `get_bulk_result(upload=true)`.
 | Tool | Purpose | Arguments |
 | --- | --- | --- |
 | `list_content_operations` | List the 12 Shopping Content operations | None |
-| `content_api` | Read or change products, inventory, and catalogs | Required `operation_name`, `merchant_id`; optional `scope`, `item_id`, `request`, `query`, `dry_run=true` |
-| `submit_uet_events` | Preview or submit 1–1,000 native UET events; obtain the tag key internally | Required `scope`, `tag_id`, `request`; optional `dry_run=true` |
+| `content_api` | Read or change products, inventory, and catalogs | Required `operation_name`, `merchant_id`; optional `scope`, `item_id`, `request`, `query`, `dry_run=true`, `session_id` (required to execute writes) |
+| `submit_uet_events` | Preview or submit 1–1,000 native UET events; obtain the tag key internally | Required `scope`, `tag_id`, `request`; optional `dry_run=true`, `session_id` (required for execution) |
 
 Content operation names: `list_products`, `get_product`, `insert_product`,
 `delete_product`, `batch_products`, `batch_inventory`, `update_inventory`,
@@ -242,7 +255,7 @@ client's PATH, use its absolute executable path as `command`.
 | `BING_ADS_DEVELOPER_TOKEN` | Microsoft Advertising developer token | Required for advertising API calls |
 | `BING_ADS_TOKEN_FILE` | Private refresh-token file | `~/.bing-ads/token.json` |
 | `BING_ADS_EXPORT_DIR` | Private reports, overflow results, and snapshots | `~/.bing-ads/exports` |
-| `BING_ADS_READ_ONLY` | Block advertising writes; allow reads, report jobs, and local previews | `false` |
+| `BING_ADS_READ_ONLY` | Block advertising writes and unlocking; allow reads, report jobs, and local previews | `false` (writes still require an unlocked session) |
 | `BING_ADS_ENVIRONMENT` | `production` or `sandbox` for the six v13 services | `production` |
 | `BING_ADS_CLIENT_SECRET` | Optional confidential/web-app secret; unnecessary for the desktop flow above | Empty |
 | `BING_ADS_REFRESH_TOKEN` | Optional seed token instead of browser login | Empty |
@@ -264,7 +277,10 @@ settings together.
    `get_model_schema`. Never invent operation or field names.
 4. Use `read_api` for reads/jobs and `write_api` for advertising changes.
    Shopping operations use `content_api`; UET events use `submit_uet_events`.
-5. Follow all continuation tokens and job IDs. A first page is not a full dataset.
+5. After user authorization, call `unlock_mutation_tools` and pass its returned
+   `session_id` with each real write. Call `lock_mutation_tools` with that ID
+   when finished. Never reuse an unlock from another conversation.
+6. Follow all continuation tokens and job IDs. A first page is not a full dataset.
 
 MCP arguments use snake_case. Native v13 request bodies use Microsoft's
 PascalCase fields. Content and UET use their own documented JSON shapes.
@@ -365,13 +381,34 @@ Example arguments for `write_api` to **preview** pausing a campaign:
 ```
 
 For an authorized change, use the actual discovered IDs, inspect the schema and
-current state, review the preview, then send the intended request with
-`dry_run=false`. Verify the resulting state afterward.
+current state, and review the preview. Then:
 
-A preview is local; Microsoft has not validated the request. The server has
-no per-session unlock tool. `BING_ADS_READ_ONLY=true` is the server-level write
-block. MCP annotations describe side effects; client approval settings determine
-when Claude asks before executing.
+1. Call `unlock_mutation_tools` with `{}`. Keep its returned `session_id` private.
+2. Send the intended request with `dry_run=false` and that `session_id`.
+3. Read the resulting state and inspect partial errors.
+4. Call `lock_mutation_tools` with the same `session_id`, including after a failure.
+
+The lock applies to `write_api`, `upload_bulk_csv`, Shopping Content writes,
+and UET event submission (before any tag key is retrieved or created). Missing,
+invented, or revoked session IDs cannot execute writes. Previews, reads, and
+report/download jobs remain available while locked.
+
+Tools remain visible so Claude can discover them and preview changes. Execution
+requires an explicit session ID because modern MCP is stateless; FastMCP's
+[session storage](https://gofastmcp.com/servers/sessions) preserves the unlock
+across requests on both modern and legacy clients. This uses FastMCP's built-in
+session creation and revocation, with no separate session database.
+
+Each unlock is independent. Locking one ID leaves other explicitly unlocked
+sessions alone and does not cancel already-started writes. IDs remain valid
+until locked or the server process exits; a transport reconnect alone does not
+revoke them. This is a local workflow guard: anyone holding an ID can use it on
+this unauthenticated, single-identity server. It is not multi-user authentication
+or proof of human approval; client approval settings determine when Claude asks.
+
+A preview is local; Microsoft has not validated the request.
+`BING_ADS_READ_ONLY=true` is an additional write block that unlocking cannot override.
+Existing clients must restart the server after updating and unlock before sending writes.
 
 Inspect partial errors and null result slots even after HTTP 200. A timeout can
 leave `mutation_outcome_unknown=true`: read the current state or poll the
@@ -427,8 +464,8 @@ A reserved or beta SDK operation remains subject to Microsoft's access restricti
 
 Current limits:
 
-- Live account discovery, report delivery, and writes have not been verified.
-  Offline tests use mocked provider responses.
+- Live campaign writes have been user-verified through Claude; report delivery
+  and full API coverage remain unverified. Offline tests use mocked provider responses.
 - Generic API and Content calls do not automatically exhaust provider pagination.
   Entity tools implement their own complete configuration/report workflows.
 - Provider URLs returned by unrelated operations are not automatically downloaded.
@@ -436,8 +473,8 @@ Current limits:
 - The local server does not host Hotel Center XML feeds or
   [live pricing callbacks](https://learn.microsoft.com/en-us/advertising/query-message/live-query),
   install website UET scripts, or transfer catalog feeds over FTP/SFTP.
-- Specialized analysis workflows and per-session mutation unlocking are unfinished.
-  Default previews and the global read-only setting are implemented.
+- Specialized analysis workflows are composed by the agent from native reports.
+  Explicit mutation sessions, default previews, and the global read-only setting are implemented.
 - UET key retrieval follows the SDK and the operation reference:
   `UetTagId` / `UetTagAuthKey`. The CAPI guide currently shows different names;
   the adapter does not guess by retrying a write.
@@ -506,9 +543,9 @@ Direct dependencies are pinned in [pyproject.toml](pyproject.toml); development
 uses [uv.lock](uv.lock). GitHub `uvx` installation resolves package dependencies;
 it does not apply the repository's development lockfile.
 
-Current local verification includes 55 offline tests, MCP discovery of all 22
-tools, and an offline execution of the README's write-preview example. These
-checks do not establish live provider behavior.
+Offline tests cover API behavior, MCP discovery of all 24 tools, and mutation
+locking on legacy and modern clients, including separate stdio requests.
+These checks do not establish live provider behavior.
 
 When updating the SDK, review the public operation inventory and side-effect
 allowlists, preserve native fields and partial results, and rerun the checks.
@@ -526,6 +563,7 @@ Keep mutation retries disabled. Add focused tests for changed behavior.
 | Tools are connected but API calls fail | Confirm developer token, user account permissions, environment, and network access to Microsoft. |
 | Report is pending | Poll the existing request ID or resume the entity tool's returned query. |
 | Advertising writes are disabled | Check the locally configured `BING_ADS_READ_ONLY` setting. |
+| Advertising writes are locked | After user authorization, call `unlock_mutation_tools` and pass its `session_id` with the write. A revoked ID or one from a previous server process cannot be reused. |
 | A preview made no change | `dry_run=true` is local preview; an authorized execution requires `dry_run=false`. |
 | Output is paginated or references an artifact | Follow the returned continuation token or retrieve the complete artifact. |
 

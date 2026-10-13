@@ -6,6 +6,8 @@ from typing import Annotated
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_session
+from fastmcp.server.sessions import InvalidSession, create_session
 from pydantic import Field
 
 from . import content, conversions, transfers
@@ -19,6 +21,16 @@ from .models import EntityQuery, Id, Scope, Service
 READ = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
 WRITE = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False}
 JOB = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False}
+CONTROL = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+MutationSession = Annotated[
+    str | None,
+    Field(description="Session ID from unlock_mutation_tools; required to execute writes."),
+]
 
 
 def create_server(settings: Settings | None = None, client: AdsClient | None = None) -> FastMCP:
@@ -48,8 +60,12 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
             "Microsoft Advertising REST v13. Start with get_accounts. Use list_operations and "
             "get_operation_schema for full native API access; inspect nested/derived models with "
             "get_model_schema. Use native PascalCase fields and decimal strings for 64-bit IDs. "
-            "write_api previews by default; dry_run=false sends a real change. Local previews are "
-            "not provider validation. Never blindly repeat a write after an uncertain outcome. "
+            "Writes start locked. After user authorization, call unlock_mutation_tools and pass "
+            "its session_id on each write; call lock_mutation_tools with that ID when finished. "
+            "write_api previews by default; dry_run=false sends a real change only with a valid "
+            "unlocked session_id. Never reuse an unlock from another conversation. "
+            "Local previews are not provider validation. Never blindly repeat a write after an "
+            "uncertain outcome. "
             "Reports/bulk jobs submit once and resume by request ID. All returned provider fields "
             "and errors are retained; oversized results are available through read_artifact. "
             "Entity performance_time uses native ReportTime with explicit ReportTimeZone. "
@@ -57,6 +73,46 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
             "uses the local signed-in user's permissions; it is not a shared multi-user gateway."
         ),
     )
+
+    async def require_mutation_session(session_id: str | None) -> None:
+        if settings.read_only:
+            raise ApiError("Advertising writes are disabled by BING_ADS_READ_ONLY.")
+        if session_id:
+            try:
+                await get_session(session_id)
+                return
+            except InvalidSession:
+                pass
+        raise ApiError(
+            "Advertising writes are locked. Call unlock_mutation_tools after user authorization "
+            "and pass its session_id with the write."
+        )
+
+    @mcp.tool(annotations=CONTROL)
+    async def unlock_mutation_tools() -> dict:
+        """Unlock writes after user authorization and return a new session_id.
+
+        Pass that ID on each real write, then call lock_mutation_tools with the same ID.
+        Each unlock is independent and lasts until locked or the server process exits.
+        This workflow guard does not override BING_ADS_READ_ONLY or Microsoft permissions.
+        """
+        if settings.read_only:
+            raise ApiError("Advertising writes are disabled by BING_ADS_READ_ONLY.")
+        return {"mutation_tools_unlocked": True, "session_id": await create_session()}
+
+    @mcp.tool(annotations=CONTROL)
+    async def lock_mutation_tools(session_id: str) -> dict:
+        """Revoke the session_id returned by unlock_mutation_tools; future writes need a new ID.
+
+        Other independently unlocked sessions are unaffected. Already-started writes are not
+        cancelled. Keep this ID private; it is a write capability on this local server.
+        """
+        try:
+            session = await get_session(session_id)
+        except InvalidSession:
+            return {"mutation_tools_unlocked": False}
+        await session.end()
+        return {"mutation_tools_unlocked": False}
 
     @mcp.tool(annotations=READ)
     def list_operations(
@@ -125,12 +181,16 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
         request: dict,
         scope: Scope | None = None,
         dry_run: bool = True,
+        session_id: MutationSession = None,
     ) -> dict:
         """Preview or execute any SDK write: campaigns, audiences, billing or insights.
 
-        dry_run=true is a local preview only. dry_run=false sends exactly once. Inspect
+        dry_run=true is a local preview only. dry_run=false requires the session_id returned
+        by unlock_mutation_tools and sends exactly once. Inspect
         PartialErrors indices and null result slots; a returned HTTP 200 can be partially failed.
         """
+        if not dry_run:
+            await require_mutation_session(session_id)
         return artifacts.bounded(
             await current.execute(service, operation_name, request, scope, dry_run=dry_run)
         )
@@ -163,12 +223,17 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
         )
 
     @mcp.tool(annotations=WRITE)
-    async def upload_bulk_csv(scope: Scope, csv_content: str, dry_run: bool = True) -> dict:
+    async def upload_bulk_csv(
+        scope: Scope, csv_content: str, dry_run: bool = True, session_id: MutationSession = None
+    ) -> dict:
         """Preview or upload native bulk CSV once; all entity types/columns pass through.
 
         Include the Format Version record (6.0). Upload result IDs/errors are retrieved with
-        get_bulk_result(upload=true). Never retry the whole file after partial failures.
+        get_bulk_result(upload=true). Real uploads require session_id from unlock_mutation_tools.
+        Never retry the whole file after partial failures.
         """
+        if not dry_run:
+            await require_mutation_session(session_id)
         return artifacts.bounded(
             await transfers.upload_bulk(current, artifacts, scope, csv_content, dry_run)
         )
@@ -194,13 +259,19 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
         request: dict | None = None,
         query: dict | None = None,
         dry_run: bool = True,
+        session_id: MutationSession = None,
     ) -> dict:
         """Execute Content reads or preview/write products, inventory and catalogs.
 
-        Writes default to local preview; dry_run=false sends the request. API-side product/
+        Writes default to local preview; dry_run=false requires session_id from
+        unlock_mutation_tools. Reads need no unlock. API-side product/
         inventory validation uses query={"dry-run":""} with dry_run=false. Catalogs have no
         API-side dry-run. Product inserts replace the whole offer: include every desired field.
         """
+        if operation_name not in content.OPERATIONS:
+            raise ApiError("Unknown Content operation. Use list_content_operations.")
+        if not dry_run and content.OPERATIONS[operation_name][3] == "write":
+            await require_mutation_session(session_id)
         return artifacts.bounded(
             await content.execute(
                 current, operation_name, merchant_id, scope, item_id, request, query, dry_run
@@ -214,17 +285,24 @@ def create_server(settings: Settings | None = None, client: AdsClient | None = N
 
     @mcp.tool(annotations=WRITE)
     async def submit_uet_events(
-        scope: Scope, tag_id: Id, request: dict, dry_run: bool = True
+        scope: Scope,
+        tag_id: Id,
+        request: dict,
+        dry_run: bool = True,
+        session_id: MutationSession = None,
     ) -> dict:
         """Preview or submit native UET Conversions API events (data array, at most 1000).
 
-        dry_run=false retrieves/creates the tag auth key and sends events once. The key
+        dry_run=false requires session_id from unlock_mutation_tools before retrieving/creating
+        the tag auth key and sending events once. The key
         stays inside the server. Preserve eventId for deduplication and use Microsoft's
         required hashed identifiers/consent fields. Inspect eventsReceived and all indexed
         errors/warnings: HTTP 200 can include skipped events or removed optional fields.
         See https://learn.microsoft.com/en-us/advertising/guides/uet-conversion-api-integration
         for native eventType, eventTime, userData, customData and other payload fields.
         """
+        if not dry_run:
+            await require_mutation_session(session_id)
         return artifacts.bounded(await conversions.submit(current, scope, tag_id, request, dry_run))
 
     @mcp.tool(annotations=READ)
